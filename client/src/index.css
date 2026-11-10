@@ -1,0 +1,3 @@
+/* Global reset. App layout and components are styled in App.css. */
+:root { color-scheme: dark; }
+body { margin: 0; min-width: 320px; }
