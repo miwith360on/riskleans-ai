@@ -3,7 +3,40 @@ import { Router, type Request, type Response } from 'express'
 const router = Router()
 const transactionIdPattern = /^TXN-\d{4}$/
 const modelEndpoint = 'https://api.openai.com/v1/chat/completions'
-const defaultModel = 'gpt-4o-mini'
+const defaultModel = 'gpt-5.4-mini'
+function makeInvestigationResponseSchema(evidenceItems: string[]) {
+  return {
+  type: 'object',
+  properties: {
+    summary: { type: 'string', minLength: 1, maxLength: 1600 },
+    observations: {
+      type: 'array',
+      maxItems: 8,
+      items: {
+        type: 'object',
+        properties: {
+          observation: { type: 'string', minLength: 1, maxLength: 500 },
+          evidence: { type: 'string', enum: evidenceItems },
+        },
+        required: ['observation', 'evidence'],
+        additionalProperties: false,
+      },
+    },
+    uncertainty: {
+      type: 'array',
+      maxItems: 8,
+      items: { type: 'string', minLength: 1, maxLength: 400 },
+    },
+    recommendedActions: {
+      type: 'array',
+      maxItems: 6,
+      items: { type: 'string', minLength: 1, maxLength: 400 },
+    },
+  },
+  required: ['summary', 'observations', 'uncertainty', 'recommendedActions'],
+  additionalProperties: false,
+  } as const
+}
 
 type RiskLevel = 'High' | 'Medium' | 'Low'
 type InvestigationEvidence = {
@@ -95,10 +128,18 @@ function isText(value: unknown, maxLength: number): value is string {
   return typeof value === 'string' && value.trim().length > 0 && value.length <= maxLength
 }
 
-function parseInvestigation(value: unknown, evidenceItems: string[]): Investigation | undefined {
+type InvestigationParseFailure =
+  | 'schema_mismatch'
+  | 'unsupported_evidence_reference'
+
+function parseInvestigation(
+  value: unknown,
+  evidenceItems: string[],
+): { investigation: Investigation } | { failure: InvestigationParseFailure } {
+  if (!isRecord(value) || !isText(value.summary, 1_600)) {
+    return { failure: 'schema_mismatch' }
+  }
   if (
-    !isRecord(value) ||
-    !isText(value.summary, 1_600) ||
     !Array.isArray(value.observations) ||
     value.observations.length > 8 ||
     !Array.isArray(value.uncertainty) ||
@@ -106,18 +147,19 @@ function parseInvestigation(value: unknown, evidenceItems: string[]): Investigat
     !Array.isArray(value.recommendedActions) ||
     value.recommendedActions.length > 6
   ) {
-    return undefined
+    return { failure: 'schema_mismatch' }
   }
-
   const observations: Investigation['observations'] = []
   for (const item of value.observations) {
     if (
       !isRecord(item) ||
       !isText(item.observation, 500) ||
-      typeof item.evidence !== 'string' ||
-      !evidenceItems.includes(item.evidence)
+      typeof item.evidence !== 'string'
     ) {
-      return undefined
+      return { failure: 'schema_mismatch' }
+    }
+    if (!evidenceItems.includes(item.evidence)) {
+      return { failure: 'unsupported_evidence_reference' }
     }
     observations.push({ observation: item.observation, evidence: item.evidence })
   }
@@ -125,7 +167,7 @@ function parseInvestigation(value: unknown, evidenceItems: string[]): Investigat
   const uncertainty: string[] = []
   for (const item of value.uncertainty) {
     if (!isText(item, 400)) {
-      return undefined
+      return { failure: 'schema_mismatch' }
     }
     uncertainty.push(item)
   }
@@ -133,22 +175,71 @@ function parseInvestigation(value: unknown, evidenceItems: string[]): Investigat
   const recommendedActions: string[] = []
   for (const item of value.recommendedActions) {
     if (!isText(item, 400)) {
-      return undefined
+      return { failure: 'schema_mismatch' }
     }
     recommendedActions.push(item)
   }
 
-  return {
-    summary: value.summary,
-    observations,
-    uncertainty,
-    recommendedActions,
-  }
+  return { investigation: {
+      summary: value.summary,
+      observations,
+      uncertainty,
+      recommendedActions,
+    } }
 }
 
 function sendAiError(res: Response, status: number, error: string) {
   res.setHeader('Cache-Control', 'no-store')
   res.status(status).json({ error })
+}
+
+function safeDiagnostic(value: unknown): string | undefined {
+  if (typeof value !== 'string') {
+    return undefined
+  }
+  const sanitized = value.replace(/[^A-Za-z0-9_.-]/g, '').slice(0, 80)
+  return sanitized || undefined
+}
+
+function classifyProviderError(status: number, providerError: unknown): {
+  status: number
+  error: string
+  code?: string
+  type?: string
+  param?: string
+} {
+  const detail = isRecord(providerError) ? providerError : {}
+  const code = safeDiagnostic(detail.code)
+  const type = safeDiagnostic(detail.type)
+  const param = safeDiagnostic(detail.param)
+
+  if (
+    status === 429 &&
+    (code === 'insufficient_quota' ||
+      code === 'billing_hard_limit_reached' ||
+      type === 'insufficient_quota')
+  ) {
+    return { status: 503, error: 'ai_insufficient_quota', code, type, param }
+  }
+  if (status === 429) {
+    return { status: 503, error: 'ai_rate_limited', code, type, param }
+  }
+  if (status === 401) {
+    return { status: 503, error: 'ai_authentication_failed', code, type, param }
+  }
+  if (status === 403) {
+    return { status: 503, error: 'ai_model_access_denied', code, type, param }
+  }
+  if (status === 404) {
+    return { status: 503, error: 'ai_model_not_found', code, type, param }
+  }
+  if (status === 400) {
+    return { status: 502, error: 'ai_invalid_request', code, type, param }
+  }
+  if (status >= 500) {
+    return { status: 502, error: 'ai_provider_outage', code, type, param }
+  }
+  return { status: 502, error: 'ai_provider_error', code, type, param }
 }
 
 router.post('/investigate', async (req: Request, res: Response) => {
@@ -191,8 +282,15 @@ router.post('/investigate', async (req: Request, res: Response) => {
       },
       body: JSON.stringify({
         model,
-        temperature: 0.2,
-        response_format: { type: 'json_object' },
+        reasoning_effort: 'low',
+        response_format: {
+          type: 'json_schema',
+          json_schema: {
+            name: 'risklens_investigation',
+            strict: true,
+            schema: makeInvestigationResponseSchema(evidenceItems),
+          },
+        },
         messages: [
           { role: 'system', content: systemPrompt },
           {
@@ -207,23 +305,82 @@ router.post('/investigate', async (req: Request, res: Response) => {
       signal: AbortSignal.timeout(20_000),
     })
 
-    if (response.status === 429) {
-      sendAiError(res, 503, 'ai_rate_limited')
-      return
-    }
     if (!response.ok) {
-      sendAiError(res, 502, 'ai_provider_unavailable')
+      const providerPayload: unknown = await response.json().catch(() => null)
+      const providerError = isRecord(providerPayload) ? providerPayload.error : undefined
+      const diagnostic = classifyProviderError(response.status, providerError)
+      const requestId = safeDiagnostic(response.headers.get('x-request-id'))
+      console.warn(JSON.stringify({
+        event: 'ai_provider_error',
+        model,
+        upstreamStatus: response.status,
+        code: diagnostic.code,
+        type: diagnostic.type,
+        param: diagnostic.param,
+        requestId,
+        category: diagnostic.error,
+      }))
+      res.setHeader('Cache-Control', 'no-store')
+      res.status(diagnostic.status).json({
+        error: diagnostic.error,
+        upstreamStatus: response.status,
+        ...(diagnostic.code ? { providerCode: diagnostic.code } : {}),
+        ...(requestId ? { requestId } : {}),
+      })
       return
     }
 
+    const requestId = safeDiagnostic(response.headers.get('x-request-id'))
     const providerPayload: unknown = await response.json().catch(() => null)
-    const content = isRecord(providerPayload) &&
+    const choice = isRecord(providerPayload) &&
       Array.isArray(providerPayload.choices) &&
-      isRecord(providerPayload.choices[0]) &&
-      isRecord(providerPayload.choices[0].message)
-      ? providerPayload.choices[0].message.content
+      isRecord(providerPayload.choices[0])
+      ? providerPayload.choices[0]
       : undefined
+    const message = choice && isRecord(choice.message) ? choice.message : undefined
+    if (!choice || !message) {
+      console.warn(JSON.stringify({
+        event: 'ai_invalid_response',
+        model,
+        reason: 'missing_choice_or_message',
+        requestId,
+      }))
+      sendAiError(res, 502, 'ai_invalid_response')
+      return
+    }
+
+    if (typeof message.refusal === 'string') {
+      console.warn(JSON.stringify({
+        event: 'ai_invalid_response',
+        model,
+        reason: 'model_refusal',
+        requestId,
+      }))
+      sendAiError(res, 502, 'ai_response_refused')
+      return
+    }
+
+    if (choice.finish_reason !== 'stop') {
+      const truncated = choice.finish_reason === 'length'
+      console.warn(JSON.stringify({
+        event: 'ai_invalid_response',
+        model,
+        reason: truncated ? 'output_truncated' : 'unexpected_finish_reason',
+        finishReason: safeDiagnostic(choice.finish_reason),
+        requestId,
+      }))
+      sendAiError(res, 502, truncated ? 'ai_response_incomplete' : 'ai_invalid_response')
+      return
+    }
+
+    const content = message.content
     if (typeof content !== 'string') {
+      console.warn(JSON.stringify({
+        event: 'ai_invalid_response',
+        model,
+        reason: 'missing_content',
+        requestId,
+      }))
       sendAiError(res, 502, 'ai_invalid_response')
       return
     }
@@ -232,12 +389,31 @@ router.post('/investigate', async (req: Request, res: Response) => {
     try {
       decoded = JSON.parse(content)
     } catch {
-      sendAiError(res, 502, 'ai_invalid_response')
+      console.warn(JSON.stringify({
+        event: 'ai_invalid_response',
+        model,
+        reason: 'invalid_json',
+        contentLength: content.length,
+        requestId,
+      }))
+      sendAiError(res, 502, 'ai_response_invalid_json')
       return
     }
-    const investigation = parseInvestigation(decoded, evidenceItems)
-    if (!investigation) {
-      sendAiError(res, 502, 'ai_invalid_response')
+    const parsedInvestigation = parseInvestigation(decoded, evidenceItems)
+    if ('failure' in parsedInvestigation) {
+      console.warn(JSON.stringify({
+        event: 'ai_invalid_response',
+        model,
+        reason: parsedInvestigation.failure,
+        requestId,
+      }))
+      sendAiError(
+        res,
+        502,
+        parsedInvestigation.failure === 'unsupported_evidence_reference'
+          ? 'ai_evidence_mismatch'
+          : 'ai_response_schema_mismatch',
+      )
       return
     }
 
@@ -247,14 +423,21 @@ router.post('/investigate', async (req: Request, res: Response) => {
       source: 'synthetic_demo',
       riskScore: input.evidence.riskScore,
       riskLevel: input.evidence.riskLevel,
-      investigation,
+      investigation: parsedInvestigation.investigation,
     })
   } catch (error) {
     if (error instanceof Error && (error.name === 'TimeoutError' || error.name === 'AbortError')) {
+      console.warn(JSON.stringify({ event: 'ai_provider_timeout', model }))
       sendAiError(res, 504, 'ai_request_timeout')
       return
     }
-    sendAiError(res, 502, 'ai_provider_unavailable')
+    const errorName = error instanceof Error ? safeDiagnostic(error.name) : undefined
+    console.warn(JSON.stringify({
+      event: 'ai_provider_network_error',
+      model,
+      errorName,
+    }))
+    sendAiError(res, 502, 'ai_network_error')
   }
 })
 

@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "start": "tsx src/index.ts",
-    "test": "tsx --test src/paypal.test.ts src/ai.test.ts",
+    "test": "tsx --test --test-concurrency=1 src/paypal.test.ts src/ai.test.ts",
     "typecheck": "tsc --noEmit --target ES2022 --module NodeNext --moduleResolution NodeNext --esModuleInterop --strict --skipLibCheck src/index.ts src/ai.ts src/paypal.ts"
   },
   "keywords": [],

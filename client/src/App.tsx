@@ -142,17 +142,49 @@ function isAiInvestigationResponse(value: unknown): value is AiInvestigationResp
 
 function aiErrorMessage(payload: unknown, status: number): string {
   const error = isRecord(payload) && typeof payload.error === 'string' ? payload.error : ''
+  const upstreamStatus = isRecord(payload) &&
+    typeof payload.upstreamStatus === 'number' &&
+    Number.isInteger(payload.upstreamStatus)
+    ? payload.upstreamStatus
+    : status
+  const providerCode = isRecord(payload) &&
+    typeof payload.providerCode === 'string' &&
+    /^[A-Za-z0-9_.-]{1,80}$/.test(payload.providerCode)
+    ? ` (OpenAI code: ${payload.providerCode})`
+    : ''
   switch (error) {
     case 'ai_not_configured':
       return 'AI is not configured. Add OPENAI_API_KEY to server/.env and restart the backend.'
+    case 'ai_insufficient_quota':
+      return 'The OpenAI API project has insufficient quota or reached its billing limit. Check API billing and usage limits.'
     case 'ai_rate_limited':
       return 'The AI provider rate limit was reached. Wait briefly, then try again.'
+    case 'ai_authentication_failed':
+      return 'OpenAI rejected the API credentials. Verify the key and project configuration in server/.env.'
+    case 'ai_model_access_denied':
+      return 'The OpenAI project is not permitted to use this model. Check model access and project settings.'
+    case 'ai_model_not_found':
+      return 'The configured OpenAI model was not found or is unavailable to this project.'
+    case 'ai_invalid_request':
+      return `OpenAI rejected the investigation request${providerCode}. Check the backend diagnostics.`
+    case 'ai_provider_outage':
+      return `OpenAI returned a server error (HTTP ${upstreamStatus}). Please try again later.`
+    case 'ai_network_error':
+      return 'The backend could not connect to OpenAI. Check network access and try again.'
     case 'ai_request_timeout':
       return 'The AI investigation timed out. Please try again.'
     case 'ai_invalid_response':
       return 'The AI provider returned an unusable response. Please try again.'
-    case 'ai_provider_unavailable':
-      return 'The AI provider is currently unavailable. Please try again later.'
+    case 'ai_response_refused':
+      return 'The AI provider declined to generate an investigation. Please try again later.'
+    case 'ai_response_incomplete':
+      return 'The AI response was incomplete. Please try again.'
+    case 'ai_response_invalid_json':
+      return 'The AI provider returned malformed structured output. Please try again.'
+    case 'ai_response_schema_mismatch':
+      return 'The AI response did not match the required investigation format. Please try again.'
+    case 'ai_evidence_mismatch':
+      return 'The AI response referenced evidence that was not provided, so it was discarded. Please try again.'
     default:
       return `The AI investigation could not be completed (HTTP ${status}).`
   }

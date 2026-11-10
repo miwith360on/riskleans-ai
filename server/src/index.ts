@@ -2,6 +2,7 @@
 import express from 'express'
 import cors from 'cors'
 import 'dotenv/config'
+import type { NextFunction, Request, Response } from 'express'
 import aiRouter from './ai'
 import paypalRouter from './paypal'
 
@@ -12,6 +13,17 @@ app.use(cors({
   origin: 'http://localhost:5173'
 }))
 app.use(express.json({ limit: '10kb' }))
+app.use((error: unknown, _req: Request, res: Response, next: NextFunction) => {
+  if (
+    error instanceof SyntaxError &&
+    'type' in error &&
+    error.type === 'entity.parse.failed'
+  ) {
+    res.status(400).json({ error: 'invalid_json' })
+    return
+  }
+  next(error)
+})
 
 app.get('/api/health', (_req, res) => {
   res.json({

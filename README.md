@@ -8,7 +8,7 @@ The Express + TypeScript backend uses PayPal Sandbox server-side OAuth credentia
 
 ### Local setup
 
-1. Copy `server/.env.example` to `server/.env` only if you do not already have `server/.env`. Add your PayPal **Sandbox** app client ID and secret to the local file. Never commit or share it. To enable AI investigations, configure `OPENAI_API_KEY` in the same local file; `OPENAI_MODEL` defaults to `gpt-4o-mini`.
+1. Copy `server/.env.example` to `server/.env` only if you do not already have `server/.env`. Add your PayPal **Sandbox** app client ID and secret to the local file. Never commit or share it. To enable AI investigations, configure `OPENAI_API_KEY` in the same local file; `OPENAI_MODEL` defaults to `gpt-5.4-mini`.
 2. In a terminal, run:
 
    ```powershell
@@ -31,7 +31,7 @@ The Express + TypeScript backend uses PayPal Sandbox server-side OAuth credentia
 
 ## AI investigation setup
 
-The backend calls OpenAI's Chat Completions API using the server-side `OPENAI_API_KEY`; no additional SDK or package is required. Create an OpenAI API project/key and configure its usage or billing limits before enabling requests. API usage is billed according to the selected model and token usage; pricing can change, so check OpenAI's current API pricing. No service is purchased or required to run the dashboard or tests.
+The backend calls OpenAI's Chat Completions API using the server-side `OPENAI_API_KEY` and defaults to `gpt-5.4-mini`; no additional SDK or package is required. The request uses low reasoning effort and strict JSON Schema output supported by this model. Create an OpenAI API project/key and configure its usage or billing limits before enabling requests. API usage is billed according to the selected model and token usage; pricing can change, so check OpenAI's current API pricing. No service is purchased or required to run the dashboard or tests.
 
 Copy the placeholder `OPENAI_API_KEY` and `OPENAI_MODEL` entries from `server/.env.example` into your local `server/.env`, replace the key locally, then restart the backend. Never commit `server/.env`. The AI feature responds with a clear unavailable error until the key is configured; tests use mocked responses and do not call OpenAI.
 
