@@ -1,0 +1,37 @@
+# Render Blueprint: one web service that builds the dashboard and serves it
+# from the Express API, so RiskLens AI runs at a single URL.
+services:
+  - type: web
+    name: risklens-ai
+    runtime: node
+    plan: free
+    buildCommand: cd client && npm ci --include=dev && npm run build && cd ../server && npm ci --include=dev
+    startCommand: cd server && npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+      - key: NODE_ENV
+        value: production
+      - key: HOST
+        value: 0.0.0.0
+      - key: DEMO_ACCESS_TOKEN
+        generateValue: true
+      - key: AI_REQUESTS_PER_MINUTE
+        value: "5"
+      - key: AI_MAX_REQUESTS
+        value: "100"
+      - key: PAYPAL_BASE_URL
+        value: https://api-m.sandbox.paypal.com
+      - key: PAYPAL_CLIENT_ID
+        sync: false
+      - key: PAYPAL_CLIENT_SECRET
+        sync: false
+      - key: PAYPAL_RETURN_URL
+        sync: false
+      - key: PAYPAL_CANCEL_URL
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: OPENAI_MODEL
+        value: gpt-5.4-mini

@@ -63,7 +63,9 @@ type AiInvestigationResponse = {
   investigation: AiInvestigation
 }
 
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? 'http://127.0.0.1:3001'
+// Local dev talks to the backend on port 3001. In a production build the
+// backend serves this page itself, so API calls go to the same site.
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? (import.meta.env.DEV ? 'http://127.0.0.1:3001' : '')
 // One shape for both fictional demo payments and real PayPal Sandbox captures.
 // Signals PayPal does not return for a capture are null and are never guessed.
 type PaymentRecord = {

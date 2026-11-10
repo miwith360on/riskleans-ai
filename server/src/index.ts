@@ -1,6 +1,8 @@
 
 import express from 'express'
 import cors from 'cors'
+import fs from 'node:fs'
+import path from 'node:path'
 import 'dotenv/config'
 import type { NextFunction, Request, Response } from 'express'
 import { assertDemoAccessTokenConfigured } from './auth'
@@ -33,14 +35,31 @@ app.get('/api/health', (_req, res) => {
   res.json({
     status: 'online',
     application: 'RiskLens AI',
-    environment: 'development',
+    environment: process.env.NODE_ENV === 'production' ? 'production' : 'development',
     message: 'RiskLens AI backend is running!'
   })
 })
 
 app.use('/api/paypal', paypalRouter)
 app.use('/api/ai', aiRouter)
+app.use('/api', (_req, res) => {
+  res.status(404).json({ error: 'not_found' })
+})
 
-app.listen(PORT, () => {
+// In production (e.g. Render) this one server also serves the built dashboard,
+// so the whole app runs at a single URL. Locally, Vite serves the dashboard instead.
+const clientDist = path.resolve(__dirname, '../../client/dist')
+if (fs.existsSync(path.join(clientDist, 'index.html'))) {
+  app.use(express.static(clientDist, { index: false, maxAge: '1h' }))
+  app.use((req, res, next) => {
+    if (req.method !== 'GET') {
+      next()
+      return
+    }
+    res.sendFile(path.join(clientDist, 'index.html'))
+  })
+}
+
+app.listen(PORT, HOST, () => {
   console.log(`RiskLens AI API running at http://${HOST}:${PORT}`)
 })
