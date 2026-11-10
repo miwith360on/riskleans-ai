@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react'
 import { AgGridReact } from 'ag-grid-react'
 import {
   AllCommunityModule,
@@ -6,6 +6,7 @@ import {
   colorSchemeDarkBlue,
   themeQuartz,
   type ColDef,
+  type RowClassRules,
 } from 'ag-grid-community'
 import './App.css'
 import './ai-investigation.css'
@@ -29,7 +30,9 @@ const riskLensGridTheme = themeQuartz.withPart(colorSchemeDarkBlue).withParams({
 })
 
 type RiskLevel = 'High' | 'Medium' | 'Low'
-type RiskFactor = { label: string; points: number; detail: string }
+type ViewFilter = 'All' | RiskLevel | 'PayPal'
+type TransactionSource = 'demo' | 'paypal_sandbox'
+type RiskFactor = { label: string; points: number; detail: string; baseline?: boolean }
 type DemoTransaction = {
   id: string
   customer: string
@@ -54,18 +57,36 @@ type AiInvestigation = {
 }
 type AiInvestigationResponse = {
   transactionId: string
-  source: 'synthetic_demo'
+  source: 'synthetic_demo' | 'paypal_sandbox'
   riskScore: number
   riskLevel: RiskLevel
   investigation: AiInvestigation
 }
 
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:3001'
-type ScoredTransaction = DemoTransaction & {
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? 'http://127.0.0.1:3001'
+// One shape for both fictional demo payments and real PayPal Sandbox captures.
+// Signals PayPal does not return for a capture are null and are never guessed.
+type PaymentRecord = {
+  id: string
+  customer: string
+  amount: number
+  currency: string
+  minutesAgo: number | null
+  paymentsIn10Min: number | null
+  newCustomer: boolean | null
+  outsideHours: boolean | null
+  source: TransactionSource
+  orderId?: string
+}
+type ScoredTransaction = PaymentRecord & {
   riskScore: number
+  rawScore: number
   riskLevel: RiskLevel
   factors: RiskFactor[]
 }
+const BASELINE_POINTS = 5
+const REVIEWED_STORAGE_KEY = 'risklens.reviewed.v1'
+const sourceLabel = (source: TransactionSource) => source === 'paypal_sandbox' ? 'PayPal Sandbox' : 'Demo'
 
 // These are deliberately fictional demonstration payments, NOT PayPal records.
 const demoTransactions: DemoTransaction[] = [
@@ -83,30 +104,73 @@ const demoTransactions: DemoTransaction[] = [
   { id: 'TXN-1031', customer: 'Mason Studio', amount: 65, minutesAgo: 340, paymentsIn10Min: 1, newCustomer: false, outsideHours: false },
 ]
 
-function assessRisk(t: DemoTransaction): ScoredTransaction {
-  const factors: RiskFactor[] = []
+function assessRisk(t: PaymentRecord): ScoredTransaction {
+  // Every payment starts with a small baseline so the visible points always add up to the score.
+  const factors: RiskFactor[] = [
+    { label: 'Baseline', points: BASELINE_POINTS, detail: 'Every payment starts with a small baseline score.', baseline: true },
+  ]
   if (t.amount > 1000) {
-    factors.push({ label: 'Large payment', points: 38, detail: 'Above the $1,000 demonstration threshold.' })
+    factors.push({ label: 'Large payment', points: 38, detail: 'Above the $1,000 threshold.' })
   } else if (t.amount > 500) {
-    factors.push({ label: 'Elevated amount', points: 22, detail: 'Above the $500 demonstration threshold.' })
+    factors.push({ label: 'Elevated amount', points: 22, detail: 'Above the $500 threshold.' })
   }
-  if (t.paymentsIn10Min >= 4) {
+  if (t.paymentsIn10Min !== null && t.paymentsIn10Min >= 4) {
     factors.push({ label: 'High payment frequency', points: 28, detail: `${t.paymentsIn10Min} payments in a simulated 10-minute window.` })
   }
-  if (t.newCustomer) {
+  if (t.newCustomer === true) {
     factors.push({ label: 'New customer', points: 18, detail: 'No previous payment history in the demo dataset.' })
   }
-  if (t.outsideHours) {
+  if (t.outsideHours === true) {
     factors.push({ label: 'Outside normal hours', points: 12, detail: 'Flagged as outside normal hours in the demo dataset.' })
   }
-  const riskScore = Math.min(100, 5 + factors.reduce((sum, factor) => sum + factor.points, 0))
+  const rawScore = factors.reduce((sum, factor) => sum + factor.points, 0)
+  const riskScore = Math.min(100, rawScore)
   const riskLevel: RiskLevel = riskScore >= 70 ? 'High' : riskScore >= 40 ? 'Medium' : 'Low'
-  return { ...t, riskScore, riskLevel, factors }
+  return { ...t, riskScore, rawScore, riskLevel, factors }
 }
 
-const scoredTransactions = demoTransactions.map(assessRisk).sort((a, b) => b.riskScore - a.riskScore)
-const money = (amount: number) => new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(amount)
-const ago = (minutes: number) => minutes < 60 ? `${minutes}m ago` : `${Math.floor(minutes / 60)}h ${minutes % 60}m ago`
+const demoScored = demoTransactions
+  .map((t): PaymentRecord => ({ ...t, currency: 'USD', source: 'demo' }))
+  .map(assessRisk)
+
+function captureToRecord(capture: PayPalSandboxCapture): PaymentRecord {
+  return {
+    id: capture.transactionId,
+    customer: 'PayPal Sandbox payment',
+    amount: Number(capture.amount),
+    currency: capture.currency,
+    minutesAgo: null,
+    paymentsIn10Min: null,
+    newCustomer: null,
+    outsideHours: null,
+    source: 'paypal_sandbox',
+    orderId: capture.orderId,
+  }
+}
+
+const money = (amount: number, currency = 'USD') => {
+  try {
+    return new Intl.NumberFormat('en-US', { style: 'currency', currency }).format(amount)
+  } catch {
+    return `${amount.toFixed(2)} ${currency}`
+  }
+}
+const ago = (minutes: number | null) => minutes === null ? '—' : minutes < 60 ? `${minutes}m ago` : `${Math.floor(minutes / 60)}h ${minutes % 60}m ago`
+const signalCount = (t: ScoredTransaction) => t.factors.filter((factor) => !factor.baseline).length
+const breakdown = (t: ScoredTransaction) =>
+  t.factors.map((factor) => `${factor.label} +${factor.points}`).join(' · ') +
+  (t.rawScore > t.riskScore ? ` = ${t.rawScore}, capped at 100` : ` = ${t.riskScore}`)
+
+function loadReviewed(): Record<string, boolean> {
+  try {
+    const stored = window.localStorage.getItem(REVIEWED_STORAGE_KEY)
+    const parsed: unknown = stored ? JSON.parse(stored) : {}
+    if (!isRecord(parsed)) return {}
+    return Object.fromEntries(Object.entries(parsed).filter(([, value]) => value === true)) as Record<string, boolean>
+  } catch {
+    return {}
+  }
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null
@@ -120,7 +184,7 @@ function isAiInvestigationResponse(value: unknown): value is AiInvestigationResp
   if (
     !isRecord(value) ||
     typeof value.transactionId !== 'string' ||
-    value.source !== 'synthetic_demo' ||
+    (value.source !== 'synthetic_demo' && value.source !== 'paypal_sandbox') ||
     typeof value.riskScore !== 'number' ||
     !['High', 'Medium', 'Low'].includes(String(value.riskLevel)) ||
     !isRecord(value.investigation)
@@ -153,6 +217,15 @@ function aiErrorMessage(payload: unknown, status: number): string {
     ? ` (OpenAI code: ${payload.providerCode})`
     : ''
   switch (error) {
+    case 'demo_access_token_required':
+    case 'invalid_demo_access_token':
+      return 'Enter a valid demo access token to use protected API features.'
+    case 'access_control_not_configured':
+      return 'The backend access token is not configured. Set DEMO_ACCESS_TOKEN and restart the backend.'
+    case 'ai_usage_limit_reached':
+      return 'The configured AI request limit has been reached for this backend process.'
+    case 'ai_limits_misconfigured':
+      return 'The backend AI request limits are invalid. Check its local configuration.'
     case 'ai_not_configured':
       return 'AI is not configured. Add OPENAI_API_KEY to server/.env and restart the backend.'
     case 'ai_insufficient_quota':
@@ -183,6 +256,10 @@ function aiErrorMessage(payload: unknown, status: number): string {
       return 'The AI provider returned malformed structured output. Please try again.'
     case 'ai_response_schema_mismatch':
       return 'The AI response did not match the required investigation format. Please try again.'
+    case 'paypal_capture_not_found':
+      return 'PayPal could not find this Sandbox capture. Refresh the PayPal captures and try again.'
+    case 'paypal_capture_unavailable':
+      return 'The backend could not load this capture from PayPal Sandbox. Check the PayPal credentials in server/.env and try again.'
     case 'ai_evidence_mismatch':
       return 'The AI response referenced evidence that was not provided, so it was discarded. Please try again.'
     default:
@@ -192,26 +269,39 @@ function aiErrorMessage(payload: unknown, status: number): string {
 
 function App() {
   const [search, setSearch] = useState('')
-  const [filter, setFilter] = useState<'All' | RiskLevel>('All')
+  const [filter, setFilter] = useState<ViewFilter>('All')
   const [selectedId, setSelectedId] = useState('TXN-1042')
-  const [reviewed, setReviewed] = useState<Record<string, boolean>>({})
+  const [accessTokenDraft, setAccessTokenDraft] = useState('')
+  const [demoAccessToken, setDemoAccessToken] = useState('')
+  const [reviewed, setReviewed] = useState<Record<string, boolean>>(loadReviewed)
+  const [displayedCount, setDisplayedCount] = useState<number | null>(null)
+  const gridRef = useRef<AgGridReact<ScoredTransaction>>(null)
   const [sandboxCaptures, setSandboxCaptures] = useState<PayPalSandboxCapture[]>([])
-  const [capturesLoading, setCapturesLoading] = useState(true)
+  const [capturesLoading, setCapturesLoading] = useState(false)
   const [capturesError, setCapturesError] = useState('')
   const [captureRefresh, setCaptureRefresh] = useState(0)
   const [aiLoading, setAiLoading] = useState(false)
   const [aiError, setAiError] = useState('')
   const [aiInvestigation, setAiInvestigation] = useState<AiInvestigationResponse | null>(null)
   const aiRequestController = useRef<AbortController | null>(null)
+  const accessTokenInput = useRef<HTMLInputElement>(null)
 
   useEffect(() => {
     const controller = new AbortController()
 
     async function loadSandboxCaptures() {
+      if (!demoAccessToken) {
+        setSandboxCaptures([])
+        setCapturesError('')
+        setCapturesLoading(false)
+        return
+      }
+
       setCapturesLoading(true)
       setCapturesError('')
       try {
         const response = await fetch(`${API_BASE_URL}/api/paypal/captures`, {
+          headers: { Authorization: `Bearer ${demoAccessToken}` },
           signal: controller.signal,
         })
         if (!response.ok) {
@@ -270,9 +360,17 @@ function App() {
 
     void loadSandboxCaptures()
     return () => controller.abort()
-  }, [captureRefresh])
+  }, [captureRefresh, demoAccessToken])
 
   useEffect(() => () => aiRequestController.current?.abort(), [])
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(REVIEWED_STORAGE_KEY, JSON.stringify(reviewed))
+    } catch {
+      // Storage can be unavailable (private mode); review state still works for this page.
+    }
+  }, [reviewed])
 
   function selectTransaction(id: string) {
     aiRequestController.current?.abort()
@@ -283,6 +381,12 @@ function App() {
   }
 
   async function investigateSelected() {
+    if (!demoAccessToken) {
+      setAiError('Paste the value after DEMO_ACCESS_TOKEN= from server/.env into the top bar, then select Connect.')
+      accessTokenInput.current?.focus()
+      return
+    }
+
     aiRequestController.current?.abort()
     const controller = new AbortController()
     aiRequestController.current = controller
@@ -293,16 +397,23 @@ function App() {
     try {
       const response = await fetch(`${API_BASE_URL}/api/ai/investigate`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${demoAccessToken}`,
+        },
         signal: controller.signal,
-        body: JSON.stringify({
+        // PayPal rows send only the capture ID: the server fetches the facts from PayPal itself.
+        body: JSON.stringify(selected.source === 'paypal_sandbox' ? {
+          source: 'paypal_sandbox',
+          transactionId: selected.id,
+        } : {
           transactionId: selected.id,
           evidence: {
             amount: selected.amount,
-            ageMinutes: selected.minutesAgo,
-            paymentsIn10Minutes: selected.paymentsIn10Min,
-            newCustomer: selected.newCustomer,
-            outsideHours: selected.outsideHours,
+            ageMinutes: selected.minutesAgo ?? 0,
+            paymentsIn10Minutes: selected.paymentsIn10Min ?? 1,
+            newCustomer: selected.newCustomer === true,
+            outsideHours: selected.outsideHours === true,
             riskScore: selected.riskScore,
             riskLevel: selected.riskLevel,
           },
@@ -345,11 +456,26 @@ function App() {
       flex: 2,
       minWidth: 185,
       filter: 'agTextColumnFilter',
+      getQuickFilterText: (params) => params.data ? `${params.data.customer} ${params.data.id} ${params.data.orderId ?? ''}` : '',
       cellRenderer: (params: { data?: ScoredTransaction }) => params.data ? (
         <div className="grid-customer">
           <strong>{params.data.customer}</strong>
-          <span>{params.data.id} · Demo</span>
+          <span>{params.data.id} · {sourceLabel(params.data.source)}</span>
         </div>
+      ) : null,
+    },
+    { field: 'id', headerName: 'TRANSACTION ID', hide: true },
+    {
+      field: 'source',
+      headerName: 'SOURCE',
+      minWidth: 130,
+      flex: 1,
+      filter: 'agTextColumnFilter',
+      valueGetter: (params) => params.data ? sourceLabel(params.data.source) : '',
+      cellRenderer: (params: { data?: ScoredTransaction }) => params.data ? (
+        <span className={`source-badge ${params.data.source === 'paypal_sandbox' ? 'paypal' : 'demo'}`}>
+          {params.data.source === 'paypal_sandbox' ? '● PayPal Sandbox' : 'Demo'}
+        </span>
       ) : null,
     },
     {
@@ -358,7 +484,7 @@ function App() {
       minWidth: 115,
       flex: 1,
       filter: 'agNumberColumnFilter',
-      valueFormatter: (params) => money(Number(params.value ?? 0)),
+      valueFormatter: (params) => money(Number(params.value ?? 0), params.data?.currency),
     },
     {
       field: 'minutesAgo',
@@ -366,8 +492,8 @@ function App() {
       minWidth: 100,
       flex: 1,
       filter: 'agNumberColumnFilter',
-      valueFormatter: (params) => ago(Number(params.value ?? 0)),
-      headerTooltip: 'Sorts and filters by minutes since payment',
+      valueFormatter: (params) => ago(params.value ?? null),
+      headerTooltip: 'Sorts and filters by minutes since payment. PayPal captures show — because timing is not used for scoring.',
     },
     {
       field: 'riskScore',
@@ -376,6 +502,8 @@ function App() {
       flex: 1,
       filter: 'agNumberColumnFilter',
       sort: 'desc',
+      headerTooltip: 'Hover a score to see how its points add up',
+      tooltipValueGetter: (params) => params.data ? breakdown(params.data) : '',
       cellRenderer: (params: { data?: ScoredTransaction }) => params.data ? (
         <div className="score-cell">
           <span className={`score-dot ${params.data.riskLevel.toLowerCase()}`} />
@@ -403,6 +531,25 @@ function App() {
     filter: true,
     resizable: true,
   }), [])
+
+  // Highlight unreviewed high-risk rows and mark real PayPal rows.
+  const rowClassRules = useMemo<RowClassRules<ScoredTransaction>>(() => ({
+    'row-high-unreviewed': (params) => params.data?.riskLevel === 'High' && !reviewed[params.data.id],
+    'row-paypal': (params) => params.data?.source === 'paypal_sandbox',
+  }), [reviewed])
+
+  function exportCsv() {
+    gridRef.current?.api.exportDataAsCsv({
+      fileName: 'risklens-payments.csv',
+      allColumns: true,
+      processCellCallback: (params) => {
+        if (params.column.getColId() === 'reviewStatus' || params.column.getColId() === 'source') {
+          return String(params.value ?? '')
+        }
+        return params.value === null || params.value === undefined ? '' : String(params.value)
+      },
+    })
+  }
 
   const captureColumnDefs = useMemo<ColDef<PayPalSandboxCapture>[]>(() => [
     { field: 'transactionId', headerName: 'PAYPAL TRANSACTION ID', minWidth: 210, flex: 2, filter: 'agTextColumnFilter' },
@@ -435,10 +582,17 @@ function App() {
   }), [])
 
 
-  const filtered = useMemo(() => scoredTransactions.filter((t) => {
-    const matchesSearch = `${t.id} ${t.customer}`.toLowerCase().includes(search.trim().toLowerCase())
-    return matchesSearch && (filter === 'All' || t.riskLevel === filter)
-  }), [search, filter])
+  const scoredTransactions = useMemo(
+    () => [...sandboxCaptures.map(captureToRecord).map(assessRisk), ...demoScored]
+      .sort((a, b) => b.riskScore - a.riskScore),
+    [sandboxCaptures],
+  )
+  const paypalCount = scoredTransactions.filter((t) => t.source === 'paypal_sandbox').length
+
+  // Search uses AG Grid's quick filter; the sidebar/risk menu narrows the row set.
+  const filtered = useMemo(() => scoredTransactions.filter((t) =>
+    filter === 'All' ? true : filter === 'PayPal' ? t.source === 'paypal_sandbox' : t.riskLevel === filter,
+  ), [scoredTransactions, filter])
 
   const selected = scoredTransactions.find((t) => t.id === selectedId) ?? scoredTransactions[0]
   const countByRisk = (level: RiskLevel) => scoredTransactions.filter((t) => t.riskLevel === level).length
@@ -447,9 +601,19 @@ function App() {
   const today = new Intl.DateTimeFormat('en-US', { month: 'short', day: 'numeric', year: 'numeric' }).format(new Date())
   const currentCount = scoredTransactions.length
 
-  const chooseFilter = (value: 'All' | RiskLevel) => {
+  const chooseFilter = (value: ViewFilter) => {
     setFilter(value)
     setSearch('')
+  }
+
+  function connectDemoAccess(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    const token = accessTokenDraft.trim()
+    if (token) {
+      setDemoAccessToken(token)
+      setAccessTokenDraft('')
+      setAiError('')
+    }
   }
 
   return (
@@ -464,10 +628,11 @@ function App() {
           <button className={filter === 'All' ? 'nav-item active' : 'nav-item'} onClick={() => chooseFilter('All')}><span>◫</span> Overview</button>
           <button className={filter === 'High' ? 'nav-item active' : 'nav-item'} onClick={() => chooseFilter('High')}><span>⚑</span> High-risk payments <em>{countByRisk('High')}</em></button>
           <button className={filter === 'Medium' ? 'nav-item active' : 'nav-item'} onClick={() => chooseFilter('Medium')}><span>◈</span> Medium-risk payments</button>
+          <button className={filter === 'PayPal' ? 'nav-item active' : 'nav-item'} onClick={() => chooseFilter('PayPal')}><span>●</span> PayPal Sandbox <em className="paypal-count">{paypalCount}</em></button>
         </nav>
         <div className="sidebar-bottom">
           <div className="demo-status"><span className="pulse-dot"/> Demo environment</div>
-          <p>The risk demo uses 12 fictional transactions. Verified PayPal Sandbox captures are shown separately.</p>
+          <p>12 fictional demo payments plus real PayPal Sandbox captures, all scored by the same transparent rules.</p>
           <span className="version">RiskLens AI · Hackathon MVP v0.1</span>
         </div>
       </aside>
@@ -475,7 +640,42 @@ function App() {
       <main className="main-content">
         <header className="topbar">
           <div className="breadcrumb">Workspace <span>/</span> Risk overview</div>
-          <div className="topbar-right"><span className="mode-pill">● SYNTHETIC + SANDBOX</span><span>{today}</span></div>
+          <div className="topbar-right">
+            <form className="access-token-form" onSubmit={connectDemoAccess}>
+              {!demoAccessToken ? (
+                <>
+                  <label className="sr-only" htmlFor="demo-access-token">Demo access token</label>
+                  <input
+                    id="demo-access-token"
+                    ref={accessTokenInput}
+                    type="password"
+                    autoComplete="off"
+                    value={accessTokenDraft}
+                    onChange={(event) => setAccessTokenDraft(event.target.value)}
+                    placeholder="Paste value after DEMO_ACCESS_TOKEN="
+                    title="Paste only the value after DEMO_ACCESS_TOKEN= in server/.env"
+                    aria-label="Demo access token"
+                  />
+                  <button type="submit" disabled={!accessTokenDraft.trim()}>Connect</button>
+                </>
+              ) : (
+                <>
+                  <span className="access-token-connected">API connected</span>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setDemoAccessToken('')
+                      setAiInvestigation(null)
+                      setAiError('')
+                    }}
+                  >
+                    Disconnect
+                  </button>
+                </>
+              )}
+            </form>
+            <span className="mode-pill">● SYNTHETIC + SANDBOX</span><span>{today}</span>
+          </div>
         </header>
 
         <section className="page-intro">
@@ -488,10 +688,10 @@ function App() {
         </section>
 
         <section className="stats-grid" aria-label="Summary metrics">
-          <article className="stat-card"><div className="stat-label">Demo payment volume <span>↗</span></div><strong>{money(totalVolume)}</strong><small>{currentCount} simulated payments</small></article>
+          <article className="stat-card"><div className="stat-label">Payment volume <span>↗</span></div><strong>{money(totalVolume)}</strong><small>{demoScored.length} demo + {paypalCount} PayPal Sandbox</small></article>
           <article className="stat-card"><div className="stat-label">High-risk flags <span className="stat-icon red">!</span></div><strong>{countByRisk('High')}</strong><small>Require closer inspection</small></article>
           <article className="stat-card"><div className="stat-label">Needs review <span className="stat-icon gold">◎</span></div><strong>{needsReview}</strong><small>High + medium, not marked reviewed</small></article>
-          <article className="stat-card"><div className="stat-label">Reviewed cases <span className="stat-icon green">✓</span></div><strong>{Object.values(reviewed).filter(Boolean).length}</strong><small>Marked during this browser session</small></article>
+          <article className="stat-card"><div className="stat-label">Reviewed cases <span className="stat-icon green">✓</span></div><strong>{Object.values(reviewed).filter(Boolean).length}</strong><small>Saved in this browser</small></article>
         </section>
 
         <section className="workspace-grid">
@@ -511,17 +711,22 @@ function App() {
             </article>
 
             <article className="panel table-panel">
-              <div className="panel-heading table-heading"><div><div className="eyebrow">SYNTHETIC DEMO DATA</div><h2>Payment activity</h2></div><span className="panel-note">{filtered.length} available</span></div>
+              <div className="panel-heading table-heading"><div><div className="eyebrow">DEMO + PAYPAL SANDBOX</div><h2>Payment activity</h2></div><div className="grid-actions"><span className="panel-note">{displayedCount ?? filtered.length} shown</span><button type="button" className="export-button" onClick={exportCsv}>Export CSV</button></div></div>
               <div className="table-tools">
                 <label className="search-box"><span aria-hidden="true">⌕</span><input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search customer or transaction ID" aria-label="Search transactions" /></label>
-                <label className="filter-box">Risk <select value={filter} onChange={(e) => setFilter(e.target.value as 'All' | RiskLevel)} aria-label="Filter by risk"><option>All</option><option>High</option><option>Medium</option><option>Low</option></select></label>
+                <label className="filter-box">Risk <select value={filter} onChange={(e) => setFilter(e.target.value as ViewFilter)} aria-label="Filter by risk"><option>All</option><option>High</option><option>Medium</option><option>Low</option><option value="PayPal">PayPal Sandbox</option></select></label>
               </div>
               <div className="risk-grid-wrapper" aria-label="AG Grid transaction investigator">
                 <AgGridReact<ScoredTransaction>
+                  ref={gridRef}
                   theme={riskLensGridTheme}
                   rowData={filtered}
                   columnDefs={columnDefs}
                   defaultColDef={defaultColDef}
+                  quickFilterText={search}
+                  rowClassRules={rowClassRules}
+                  tooltipShowDelay={200}
+                  onModelUpdated={(event) => setDisplayedCount(event.api.getDisplayedRowCount())}
                   getRowId={(params) => params.data.id}
                   rowSelection={{ mode: 'singleRow', checkboxes: false, enableClickSelection: true }}
                   onRowClicked={(event) => { if (event.data) selectTransaction(event.data.id) }}
@@ -530,21 +735,26 @@ function App() {
                   animateRows
                 />
               </div>
-              <div className="table-footer">Click any row to investigate. Click a column header to sort or use its menu to filter. These fictional transactions are separate from PayPal Sandbox activity.</div>
+              <div className="table-footer">Click any row to investigate. Sort or filter from any column header, and hover a score to see how its points add up. PayPal Sandbox rows are real captures; Demo rows are fictional.</div>
             </article>
           </div>
 
           <aside className="panel details-panel" aria-label="Investigation details">
             <div className="panel-heading"><div><div className="eyebrow">INVESTIGATION</div><h2>Transaction details</h2></div><span className="detail-symbol">◎</span></div>
-            <div className="detail-customer"><small>SELECTED PAYMENT</small><h3>{selected.customer}</h3><div className="detail-meta">{selected.id} · Demo transaction</div></div>
-            <div className="detail-amount">{money(selected.amount)}</div>
+            <div className="detail-customer"><small>SELECTED PAYMENT</small><h3>{selected.customer}</h3><div className="detail-meta">{selected.id} · {selected.source === 'paypal_sandbox' ? `PayPal Sandbox capture · Order ${selected.orderId}` : 'Demo transaction'}</div></div>
+            <div className="detail-amount">{money(selected.amount, selected.currency)}</div>
             <div className="score-box"><div><span>ANOMALY SCORE</span><strong>{selected.riskScore}<small>/100</small></strong></div><span className={`large-risk-badge ${selected.riskLevel.toLowerCase()}`}>{selected.riskLevel} signal</span></div>
-            <div className="detail-section"><h3>Why it was flagged</h3>
-              {selected.factors.length ? selected.factors.map((factor) => (
-                <div className="factor-item" key={factor.label}><div className="factor-icon">+</div><div><strong>{factor.label} <span>+{factor.points}</span></strong><p>{factor.detail}</p></div></div>
-              )) : <p className="no-factors">No unusual signals under the demonstration rules.</p>}
+            <div className="detail-section"><h3>How the score adds up</h3>
+              {selected.factors.map((factor) => (
+                <div className={`factor-item ${factor.baseline ? 'baseline' : ''}`} key={factor.label}><div className="factor-icon">+</div><div><strong>{factor.label} <span>+{factor.points}</span></strong><p>{factor.detail}</p></div></div>
+              ))}
+              {signalCount(selected) === 0 && <p className="no-factors">No unusual signals under the rules.</p>}
+              <p className="score-total">Total: {selected.rawScore}{selected.rawScore > selected.riskScore ? ' → capped at 100' : ''}</p>
+              {selected.source === 'paypal_sandbox' && (
+                <p className="no-factors">PayPal capture data has no payment history, timing window or customer tenure, so those rules are not applied rather than guessed.</p>
+              )}
             </div>
-            <div className="explain-box"><div className="explain-title">✧ Evidence summary</div><p>{selected.factors.length ? `This fictional payment has ${selected.factors.length} noteworthy indicator${selected.factors.length > 1 ? 's' : ''} under the demo rules.` : 'This fictional payment did not trigger the configured unusual-payment indicators.'} No real customer history or device information is available.</p><small>Deterministic summary · score is not a fraud probability</small></div>
+            <div className="explain-box"><div className="explain-title">✧ Evidence summary</div><p>{signalCount(selected) ? `This ${selected.source === 'paypal_sandbox' ? 'PayPal Sandbox' : 'fictional'} payment has ${signalCount(selected)} noteworthy indicator${signalCount(selected) > 1 ? 's' : ''} under the rules.` : `This ${selected.source === 'paypal_sandbox' ? 'PayPal Sandbox' : 'fictional'} payment did not trigger any unusual-payment indicators.`} No real customer history or device information is available.</p><small>Deterministic summary · score is not a fraud probability</small></div>
             <section className="ai-investigation" aria-label="AI investigation">
               <button
                 className="ai-investigate-button"
@@ -553,9 +763,13 @@ function App() {
                 disabled={aiLoading}
                 aria-busy={aiLoading}
               >
-                {aiLoading ? <><span className="ai-spinner" aria-hidden="true" /> Investigating…</> : '✧ Investigate with AI'}
+                {aiLoading
+                  ? <><span className="ai-spinner" aria-hidden="true" /> Investigating…</>
+                  : demoAccessToken ? '✧ Investigate with AI' : 'Connect to investigate with AI'}
               </button>
-              <p className="ai-disclaimer">Uses only synthetic demo evidence. Advisory only; no PayPal action is taken.</p>
+              <p className="ai-disclaimer">{selected.source === 'paypal_sandbox'
+                ? 'The server fetches this capture directly from PayPal Sandbox; the AI sees only PayPal-returned facts, never IDs or customer details.'
+                : 'Uses only synthetic demo evidence.'}{demoAccessToken ? '' : ' To connect, paste the value after DEMO_ACCESS_TOKEN= from server/.env in the top bar.'} Advisory only; no PayPal action is taken.</p>
               {aiLoading && <p className="ai-message" role="status">Requesting a grounded review from the configured AI provider…</p>}
               {aiError && <p className="ai-message error" role="alert">{aiError}</p>}
               {aiInvestigation && (
@@ -584,7 +798,7 @@ function App() {
               )}
             </section>
             <button className={`review-button ${reviewed[selected.id] ? 'is-reviewed' : ''}`} onClick={() => setReviewed((prev) => ({ ...prev, [selected.id]: !prev[selected.id] }))}>{reviewed[selected.id] ? '✓ Marked reviewed · Undo' : '✓ Mark transaction reviewed'}</button>
-            <p className="review-footnote">Review status is saved only while this page stays open.</p>
+            <p className="review-footnote">Review status is saved in this browser.</p>
           </aside>
         </section>
         <section className="panel capture-panel" aria-label="Verified PayPal Sandbox captures">
@@ -592,17 +806,19 @@ function App() {
             <div><div className="eyebrow">PAYPAL SANDBOX · VERIFIED</div><h2>Completed captures</h2></div>
             <div className="capture-panel-actions">
               <span className="panel-note">{sandboxCaptures.length} verified</span>
-              <button className="capture-refresh" type="button" onClick={() => setCaptureRefresh((value) => value + 1)} disabled={capturesLoading}>
+              <button className="capture-refresh" type="button" onClick={() => setCaptureRefresh((value) => value + 1)} disabled={capturesLoading || !demoAccessToken}>
                 {capturesLoading ? 'Refreshing…' : 'Refresh'}
               </button>
             </div>
           </div>
-          <p className="capture-disclaimer">Actual completed Sandbox captures returned by PayPal. No risk score or customer details are inferred.</p>
+          <p className="capture-disclaimer">Raw completed captures returned by the PayPal Orders API. Each one is also scored in Payment activity above; no customer details are inferred.</p>
           {capturesError ? (
             <div className="capture-message error" role="alert">
               <span>{capturesError}</span>
               <button className="capture-refresh" type="button" onClick={() => setCaptureRefresh((value) => value + 1)}>Try again</button>
             </div>
+          ) : !demoAccessToken ? (
+            <p className="capture-message">Enter your demo access token above to view verified Sandbox captures.</p>
           ) : capturesLoading ? (
             <p className="capture-message" role="status">Loading verified Sandbox captures…</p>
           ) : sandboxCaptures.length === 0 ? (

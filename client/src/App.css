@@ -11,3 +11,16 @@
 .grid-customer span { font-size: 10px; color: #8293ac; }
 .risk-grid-wrapper .score-cell { white-space: nowrap; }
 .capture-panel{margin-top:17px}.capture-panel-actions{display:flex;align-items:center;gap:14px}.capture-refresh{border:1px solid #2b5362;border-radius:8px;background:#142b3a;color:#83e1d8;padding:8px 12px;font-size:11px;font-weight:700}.capture-refresh:hover:not(:disabled){background:#1b3a4b}.capture-refresh:disabled{opacity:.6;cursor:wait}.capture-disclaimer{margin:14px 0 16px;color:#8092aa;font-size:11px;line-height:1.5}.capture-grid{height:190px}.capture-message{display:flex;align-items:center;justify-content:space-between;gap:16px;min-height:84px;margin:0;padding:20px;border:1px solid #263348;border-radius:10px;background:#0d1726;color:#9eafc5;font-size:12px}.capture-message.error{border-color:#623440;color:#ffb0b8}.status.completed{background:#1a3b36;color:#60d3ad}
+
+/* --- RiskLens: PayPal rows, AG Grid extras, score breakdown --- */
+.source-badge { display: inline-flex; align-items: center; padding: 3px 9px; border-radius: 999px; font-size: 11px; font-weight: 700; line-height: 1.4; }
+.source-badge.demo { background: #1b2a3e; color: #9aacc1; }
+.source-badge.paypal { background: rgba(0, 156, 222, 0.16); color: #4cc3ff; border: 1px solid rgba(0, 156, 222, 0.45); }
+.ag-row.row-paypal { box-shadow: inset 3px 0 0 #009cde; }
+.ag-row.row-high-unreviewed { background-color: rgba(255, 107, 87, 0.06); }
+.grid-actions { display: flex; align-items: center; gap: 10px; }
+.export-button { background: transparent; color: #53cfc4; border: 1px solid #2f5f63; border-radius: 8px; padding: 6px 12px; font-size: 12px; font-weight: 700; cursor: pointer; }
+.export-button:hover { background: #163a40; }
+.factor-item.baseline { opacity: 0.7; }
+.score-total { margin: 10px 0 0; font-size: 12px; font-weight: 700; color: #9aacc1; }
+.nav-item em.paypal-count { background: rgba(0, 156, 222, 0.2); color: #4cc3ff; }

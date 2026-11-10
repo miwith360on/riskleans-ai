@@ -2,7 +2,10 @@ import assert from 'node:assert/strict'
 import { once } from 'node:events'
 import { test, type TestContext } from 'node:test'
 import express from 'express'
-import aiRouter from './ai'
+import { createAiRouter, InMemoryAiRequestLimiter } from './ai'
+import { assertDemoAccessTokenConfigured } from './auth'
+
+const demoAccessToken = 'test-demo-access-token-with-at-least-32-chars'
 
 const requestBody = {
   transactionId: 'TXN-1042',
@@ -21,11 +24,17 @@ async function postInvestigation(
   t: TestContext,
   body: unknown,
   providerFetch?: typeof fetch,
+  options: {
+    authorization?: string | null
+    limiter?: InMemoryAiRequestLimiter
+  } = {},
 ): Promise<Response> {
   const previousFetch = globalThis.fetch
   const previousApiKey = process.env.OPENAI_API_KEY
   const previousModel = process.env.OPENAI_MODEL
+  const previousAccessToken = process.env.DEMO_ACCESS_TOKEN
   delete process.env.OPENAI_MODEL
+  process.env.DEMO_ACCESS_TOKEN = demoAccessToken
   globalThis.fetch = providerFetch ?? (async () => {
     throw new Error('Unexpected model API request')
   })
@@ -42,11 +51,22 @@ async function postInvestigation(
     } else {
       process.env.OPENAI_MODEL = previousModel
     }
+    if (previousAccessToken === undefined) {
+      delete process.env.DEMO_ACCESS_TOKEN
+    } else {
+      process.env.DEMO_ACCESS_TOKEN = previousAccessToken
+    }
   })
 
   const app = express()
   app.use(express.json({ limit: '10kb' }))
-  app.use('/api/ai', aiRouter)
+  app.use(
+    '/api/ai',
+    createAiRouter(options.limiter ?? new InMemoryAiRequestLimiter({
+      requestsPerMinute: 100,
+      maxRequests: 1_000,
+    })),
+  )
   const server = app.listen(0)
   await once(server, 'listening')
   t.after(() => new Promise<void>((resolve, reject) => {
@@ -55,10 +75,14 @@ async function postInvestigation(
 
   const address = server.address()
   assert.ok(address && typeof address !== 'string')
+  const headers = new Headers({ 'Content-Type': 'application/json' })
+  if (options.authorization !== null) {
+    headers.set('Authorization', options.authorization ?? `Bearer ${demoAccessToken}`)
+  }
   try {
     return await previousFetch(`http://127.0.0.1:${address.port}/api/ai/investigate`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers,
       body: JSON.stringify(body),
     })
   } finally {
@@ -75,6 +99,42 @@ test('rejects invalid transaction identifiers and evidence before contacting the
   }, async () => {
     providerCalls += 1
     return Response.json({})
+  })
+
+  test('rejects missing and incorrect demo access tokens before contacting the model', async (t) => {
+    process.env.OPENAI_API_KEY = 'test-key'
+    let providerCalls = 0
+    const providerFetch = async () => {
+      providerCalls += 1
+      return Response.json({})
+    }
+    const missing = await postInvestigation(t, requestBody, providerFetch, { authorization: null })
+    assert.equal(missing.status, 401)
+    assert.deepEqual(await missing.json(), { error: 'demo_access_token_required' })
+
+    const invalid = await postInvestigation(t, requestBody, providerFetch, {
+      authorization: 'Bearer wrong-token',
+    })
+
+    test('requires a strong demo token in production configuration', (t) => {
+      const previousNodeEnv = process.env.NODE_ENV
+      const previousAccessToken = process.env.DEMO_ACCESS_TOKEN
+      t.after(() => {
+        if (previousNodeEnv === undefined) delete process.env.NODE_ENV
+        else process.env.NODE_ENV = previousNodeEnv
+        if (previousAccessToken === undefined) delete process.env.DEMO_ACCESS_TOKEN
+        else process.env.DEMO_ACCESS_TOKEN = previousAccessToken
+      })
+
+      process.env.NODE_ENV = 'production'
+      delete process.env.DEMO_ACCESS_TOKEN
+      assert.throws(() => assertDemoAccessTokenConfigured(), /DEMO_ACCESS_TOKEN/)
+      process.env.DEMO_ACCESS_TOKEN = demoAccessToken
+      assert.doesNotThrow(() => assertDemoAccessTokenConfigured())
+    })
+    assert.equal(invalid.status, 401)
+    assert.deepEqual(await invalid.json(), { error: 'invalid_demo_access_token' })
+    assert.equal(providerCalls, 0)
   })
 
   assert.equal(response.status, 400)
@@ -157,6 +217,7 @@ test('returns a grounded model response without sending identifiers or names to 
   const providerRequest = JSON.parse(requestJson) as {
     model: string
     temperature?: number
+    max_completion_tokens: number
     reasoning_effort: string
     response_format: {
       type: string
@@ -175,6 +236,7 @@ test('returns a grounded model response without sending identifiers or names to 
   }
   assert.equal(providerRequest.model, 'gpt-5.4-mini')
   assert.equal(providerRequest.temperature, undefined)
+  assert.equal(providerRequest.max_completion_tokens, 1_200)
   assert.equal(providerRequest.reasoning_effort, 'low')
   assert.equal(providerRequest.response_format.type, 'json_schema')
   assert.equal(providerRequest.response_format.json_schema.strict, true)
@@ -200,6 +262,68 @@ test('maps provider rate limits to a retryable service-unavailable response', as
   assert.deepEqual(await response.json(), {
     error: 'ai_rate_limited',
     upstreamStatus: 429,
+  })
+
+  test('rate limits requests before invoking the provider', async (t) => {
+    process.env.OPENAI_API_KEY = 'test-key'
+    const limiter = new InMemoryAiRequestLimiter({ requestsPerMinute: 1, maxRequests: 10 })
+    let providerCalls = 0
+    const providerFetch = async () => {
+      providerCalls += 1
+      return Response.json({
+        choices: [{
+          finish_reason: 'stop',
+          message: { content: JSON.stringify({
+            summary: 'Synthetic transaction reviewed.',
+            observations: [],
+            uncertainty: ['Synthetic evidence only.'],
+            recommendedActions: ['Human review only.'],
+          }) },
+        }],
+      })
+    }
+    const first = await postInvestigation(t, requestBody, providerFetch, { limiter })
+    assert.equal(first.status, 200)
+    const second = await postInvestigation(t, requestBody, providerFetch, { limiter })
+    assert.equal(second.status, 429)
+    assert.equal(second.headers.get('retry-after'), '60')
+    assert.deepEqual(await second.json(), { error: 'ai_rate_limited' })
+    assert.equal(providerCalls, 1)
+  })
+
+  test('enforces the process-wide AI request cap before provider invocation', async (t) => {
+    process.env.OPENAI_API_KEY = 'test-key'
+    const limiter = new InMemoryAiRequestLimiter({ requestsPerMinute: 10, maxRequests: 1 })
+    let providerCalls = 0
+    const providerFetch = async () => {
+      providerCalls += 1
+      return Response.json({
+        choices: [{
+          finish_reason: 'stop',
+          message: { content: JSON.stringify({
+            summary: 'Synthetic transaction reviewed.',
+            observations: [],
+            uncertainty: ['Synthetic evidence only.'],
+            recommendedActions: ['Human review only.'],
+          }) },
+        }],
+      })
+
+      test('atomically limits simultaneous AI request reservations', async () => {
+        const limiter = new InMemoryAiRequestLimiter({ requestsPerMinute: 1, maxRequests: 10 })
+        const results = await Promise.all(
+          Array.from({ length: 10 }, () => Promise.resolve().then(() => limiter.acquire())),
+        )
+        assert.equal(results.filter((result) => result === 'allowed').length, 1)
+        assert.equal(results.filter((result) => result === 'rate_limited').length, 9)
+      })
+    }
+    const first = await postInvestigation(t, requestBody, providerFetch, { limiter })
+    assert.equal(first.status, 200)
+    const second = await postInvestigation(t, requestBody, providerFetch, { limiter })
+    assert.equal(second.status, 429)
+    assert.deepEqual(await second.json(), { error: 'ai_usage_limit_reached' })
+    assert.equal(providerCalls, 1)
   })
 })
 
@@ -338,4 +462,94 @@ test('reports truncated output distinctly from malformed structured content', as
   }))
   assert.equal(malformed.status, 502)
   assert.deepEqual(await malformed.json(), { error: 'ai_response_invalid_json' })
+})
+
+test('investigates a PayPal Sandbox capture using only facts fetched from PayPal', async (t) => {
+  process.env.OPENAI_API_KEY = 'test-key'
+  const previousPayPal = {
+    base: process.env.PAYPAL_BASE_URL,
+    id: process.env.PAYPAL_CLIENT_ID,
+    secret: process.env.PAYPAL_CLIENT_SECRET,
+  }
+  process.env.PAYPAL_BASE_URL = 'https://api-m.sandbox.paypal.com'
+  process.env.PAYPAL_CLIENT_ID = 'test-client'
+  process.env.PAYPAL_CLIENT_SECRET = 'test-secret'
+  t.after(() => {
+    for (const [key, value] of [
+      ['PAYPAL_BASE_URL', previousPayPal.base],
+      ['PAYPAL_CLIENT_ID', previousPayPal.id],
+      ['PAYPAL_CLIENT_SECRET', previousPayPal.secret],
+    ] as const) {
+      if (value === undefined) delete process.env[key]
+      else process.env[key] = value
+    }
+  })
+
+  let modelRequest = ''
+  const response = await postInvestigation(t, {
+    source: 'paypal_sandbox',
+    transactionId: '4CK42679OL825515W',
+    // Browser-supplied evidence must be ignored for PayPal captures.
+    evidence: { amount: 999999, riskScore: 100, riskLevel: 'High' },
+  }, async (input, init) => {
+    const url = String(input)
+    if (url.endsWith('/v1/oauth2/token')) {
+      return Response.json({ access_token: 'sandbox-token', expires_in: 3600 })
+    }
+    if (url.endsWith('/v2/payments/captures/4CK42679OL825515W')) {
+      return Response.json({
+        id: '4CK42679OL825515W',
+        status: 'COMPLETED',
+        amount: { currency_code: 'USD', value: '10.00' },
+        final_capture: true,
+        create_time: '2026-11-09T23:58:00Z',
+        seller_protection: { status: 'ELIGIBLE', dispute_categories: ['ITEM_NOT_RECEIVED', 'UNAUTHORIZED_TRANSACTION'] },
+        seller_receivable_breakdown: {
+          gross_amount: { currency_code: 'USD', value: '10.00' },
+          paypal_fee: { currency_code: 'USD', value: '0.84' },
+          net_amount: { currency_code: 'USD', value: '9.16' },
+        },
+        supplementary_data: { related_ids: { order_id: '25H57639MT004512P' } },
+      })
+    }
+    modelRequest = String(init?.body)
+    return Response.json({
+      choices: [{
+        finish_reason: 'stop',
+        message: {
+          content: JSON.stringify({
+            summary: 'A small completed Sandbox payment with seller protection.',
+            observations: [{
+              observation: 'PayPal reports this payment as eligible for seller protection.',
+              evidence: 'PayPal seller protection: ELIGIBLE (covers: ITEM_NOT_RECEIVED, UNAUTHORIZED_TRANSACTION).',
+            }],
+            uncertainty: ['No customer history is available from capture data.'],
+            recommendedActions: ['Confirm the order was fulfilled before marking it reviewed.'],
+          }),
+        },
+      }],
+    })
+  })
+
+  assert.equal(response.status, 200)
+  const body = await response.json() as { source: string; transactionId: string; riskScore: number; riskLevel: string }
+  assert.equal(body.source, 'paypal_sandbox')
+  assert.equal(body.transactionId, '4CK42679OL825515W')
+  assert.equal(body.riskScore, 5)
+  assert.equal(body.riskLevel, 'Low')
+  assert.equal(modelRequest.includes('4CK42679OL825515W'), false)
+  assert.equal(modelRequest.includes('25H57639MT004512P'), false)
+  assert.equal(modelRequest.includes('999999'), false)
+  assert.equal(modelRequest.includes('10.00 USD (PayPal Sandbox capture)'), true)
+})
+
+test('rejects PayPal capture IDs with unsafe characters before contacting PayPal or the model', async (t) => {
+  process.env.OPENAI_API_KEY = 'test-key'
+  let calls = 0
+  const response = await postInvestigation(t, { source: 'paypal_sandbox', transactionId: '../orders/X' }, async () => {
+    calls += 1
+    return Response.json({})
+  })
+  assert.equal(response.status, 400)
+  assert.equal(calls, 0)
 })
