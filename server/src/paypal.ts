@@ -32,6 +32,7 @@ type VerifiedSandboxCapture = {
   status: 'COMPLETED'
   amount: string
   currency: string
+  createTime?: string
 }
 
 class PayPalApiError extends Error {
@@ -230,7 +231,28 @@ function findApprovalUrl(order: PayPalOrder): string | undefined {
   return undefined
 }
 
-router.post('/orders', async (_req: Request, res: Response) => {
+// Test payment amounts are limited to a safe Sandbox range.
+const minTestAmount = 1
+const maxTestAmount = 5000
+
+function parseTestAmount(body: unknown): string | undefined {
+  const raw = isRecord(body) ? body.amount : undefined
+  if (raw === undefined) {
+    return '10.00'
+  }
+  const amount = typeof raw === 'number' ? raw : typeof raw === 'string' && /^\d{1,4}(\.\d{1,2})?$/.test(raw) ? Number(raw) : NaN
+  if (!Number.isFinite(amount) || amount < minTestAmount || amount > maxTestAmount) {
+    return undefined
+  }
+  return amount.toFixed(2)
+}
+
+router.post('/orders', async (req: Request, res: Response) => {
+  const amount = parseTestAmount(req.body)
+  if (!amount) {
+    res.status(400).json({ error: 'invalid_amount' })
+    return
+  }
   if (registeredOrders.size >= maxRegisteredOrders) {
     res.status(503).json({ error: 'order_registry_full' })
     return
@@ -243,7 +265,7 @@ router.post('/orders', async (_req: Request, res: Response) => {
         {
           reference_id: 'risklens-sandbox-test',
           description: 'RiskLens AI Sandbox Test Product',
-          amount: { currency_code: 'USD', value: '10.00' },
+          amount: { currency_code: 'USD', value: amount },
         },
       ],
       application_context: {
@@ -447,13 +469,17 @@ function extractCompletedCaptures(order: unknown): VerifiedSandboxCapture[] {
         continue
       }
 
-      captures.push({
+      const verified: VerifiedSandboxCapture = {
         orderId: order.id,
         transactionId: capture.id,
         status: 'COMPLETED',
         amount: capture.amount.value,
         currency: capture.amount.currency_code,
-      })
+      }
+      if (typeof capture.create_time === 'string' && !Number.isNaN(Date.parse(capture.create_time))) {
+        verified.createTime = new Date(capture.create_time).toISOString()
+      }
+      captures.push(verified)
     }
   }
 
@@ -462,7 +488,11 @@ function extractCompletedCaptures(order: unknown): VerifiedSandboxCapture[] {
 
 router.get('/captures', async (_req: Request, res: Response) => {
   try {
-    const orderIds = getCaptureOrderIds()
+    // Configured orders plus any test payments captured by this server process.
+    const capturedThisSession = [...registeredOrders.entries()]
+      .filter(([, order]) => order.state === 'captured')
+      .map(([orderId]) => orderId)
+    const orderIds = [...new Set([...getCaptureOrderIds(), ...capturedThisSession])]
     const orders = await Promise.all(
       orderIds.map((orderId) =>
         paypalRequest<unknown>(
@@ -602,4 +632,10 @@ export function scoreVerifiedCapture(capture: VerifiedCaptureDetails): { riskSco
   const riskScore = Math.min(100, 5 + amountPoints)
   const riskLevel = riskScore >= 70 ? 'High' : riskScore >= 40 ? 'Medium' : 'Low'
   return { riskScore, riskLevel }
+}
+
+// Test-only helper: forget in-memory orders and the cached OAuth token.
+export function resetPayPalStateForTests(): void {
+  registeredOrders.clear()
+  cachedToken = undefined
 }

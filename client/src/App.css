@@ -24,3 +24,26 @@
 .factor-item.baseline { opacity: 0.7; }
 .score-total { margin: 10px 0 0; font-size: 12px; font-weight: 700; color: #9aacc1; }
 .nav-item em.paypal-count { background: rgba(0, 156, 222, 0.2); color: #4cc3ff; }
+
+/* --- PayPal Sandbox checkout --- */
+.checkout-panel { margin-bottom: 18px; }
+.checkout-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-top: 12px; }
+.amount-presets { display: flex; gap: 6px; }
+.amount-presets .preset { background: #142136; color: #c9d4e3; border: 1px solid #263348; border-radius: 8px; padding: 8px 12px; font-weight: 700; font-size: 13px; cursor: pointer; }
+.amount-presets .preset.active { border-color: #009cde; color: #4cc3ff; background: rgba(0, 156, 222, 0.12); }
+.amount-input { display: flex; align-items: center; gap: 4px; background: #0d1726; border: 1px solid #263348; border-radius: 8px; padding: 0 10px; }
+.amount-input span { color: #9aacc1; font-weight: 700; }
+.amount-input input { width: 90px; background: transparent; border: 0; color: #e8edf6; font-size: 13px; padding: 8px 0; outline: none; }
+.checkout-button { background: #ffc439; color: #111c2d; border: 0; border-radius: 999px; padding: 10px 18px; font-weight: 800; font-size: 13px; cursor: pointer; }
+.checkout-button:disabled { opacity: 0.55; cursor: not-allowed; }
+.checkout-status { margin-top: 12px; font-size: 12.5px; color: #9aacc1; }
+.checkout-status p { margin: 0; line-height: 1.5; }
+.checkout-status p.ok { color: #6ee7b7; font-weight: 700; }
+.checkout-status p.error { color: #ff9b8a; }
+.checkout-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-top: 10px; }
+.checkout-actions a.capture-refresh { text-decoration: none; display: inline-flex; align-items: center; }
+.link-button { background: none; border: 0; color: #53cfc4; font-size: 12px; font-weight: 700; cursor: pointer; padding: 0; }
+.checkout-return { min-height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; padding: 24px; text-align: center; background: #0b1422; color: #e8edf6; font-family: inherit; }
+.checkout-return h1 { margin: 8px 0 0; font-size: 24px; }
+.checkout-return p { margin: 0; color: #9aacc1; max-width: 340px; line-height: 1.5; }
+.checkout-return button { margin-top: 8px; background: #53cfc4; color: #0b1422; border: 0; border-radius: 999px; padding: 10px 18px; font-weight: 800; cursor: pointer; }

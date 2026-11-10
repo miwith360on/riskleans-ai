@@ -48,6 +48,59 @@ type PayPalSandboxCapture = {
   status: 'COMPLETED'
   amount: string
   currency: string
+  createTime?: string
+}
+type CheckoutState =
+  | { step: 'idle' }
+  | { step: 'creating' }
+  | { step: 'waiting'; orderId: string; approvalUrl: string; amount: string }
+  | { step: 'capturing'; orderId: string; amount: string }
+  | { step: 'done'; captureId: string; amount: string }
+  | { step: 'error'; message: string; orderId?: string; approvalUrl?: string; amount?: string }
+
+// PayPal returns the buyer to ?paypal=return&token=<order id> after approval.
+const CHECKOUT_CHANNEL = 'risklens-paypal-checkout'
+const CHECKOUT_STORAGE_KEY = 'risklens.paypal.checkout.v1'
+const CHECKOUT_WINDOW_NAME = 'risklens-paypal'
+const orderIdPattern = /^[A-Z0-9]{1,64}$/i
+const initialParams = new URLSearchParams(window.location.search)
+const returnedFromPayPal = initialParams.get('paypal')
+const returnedOrderId = (() => {
+  const token = initialParams.get('token')
+  return token && orderIdPattern.test(token) ? token : undefined
+})()
+const CHECKOUT_POPUP_FLAG = 'risklens.checkoutPopup'
+const isCheckoutPopup = Boolean(returnedFromPayPal) && (() => {
+  if (window.name === CHECKOUT_WINDOW_NAME || window.opener) return true
+  try {
+    // Set on the popup before it leaves for PayPal; survives the round trip in that tab.
+    return window.sessionStorage.getItem(CHECKOUT_POPUP_FLAG) === '1'
+  } catch {
+    return false
+  }
+})()
+
+function announceCheckoutResult(kind: 'approved' | 'cancelled', orderId?: string) {
+  const message = { kind, orderId, at: Date.now() }
+  try {
+    const channel = new BroadcastChannel(CHECKOUT_CHANNEL)
+    channel.postMessage(message)
+    channel.close()
+  } catch {
+    // BroadcastChannel unsupported; the storage event below still notifies the dashboard.
+  }
+  try {
+    window.localStorage.setItem(CHECKOUT_STORAGE_KEY, JSON.stringify(message))
+  } catch {
+    // Storage unavailable; the dashboard's Finish payment button still works.
+  }
+}
+
+if (returnedFromPayPal === 'return' || returnedFromPayPal === 'cancel') {
+  announceCheckoutResult(returnedFromPayPal === 'return' ? 'approved' : 'cancelled', returnedOrderId)
+  if (!isCheckoutPopup) {
+    window.history.replaceState(null, '', window.location.pathname)
+  }
 }
 type AiInvestigation = {
   summary: string
@@ -141,7 +194,10 @@ function captureToRecord(capture: PayPalSandboxCapture): PaymentRecord {
     customer: 'PayPal Sandbox payment',
     amount: Number(capture.amount),
     currency: capture.currency,
-    minutesAgo: null,
+    // Shown for context only; timing is not used to score PayPal captures.
+    minutesAgo: capture.createTime && !Number.isNaN(Date.parse(capture.createTime))
+      ? Math.max(0, Math.round((Date.now() - Date.parse(capture.createTime)) / 60_000))
+      : null,
     paymentsIn10Min: null,
     newCustomer: null,
     outsideHours: null,
@@ -157,7 +213,7 @@ const money = (amount: number, currency = 'USD') => {
     return `${amount.toFixed(2)} ${currency}`
   }
 }
-const ago = (minutes: number | null) => minutes === null ? '—' : minutes < 60 ? `${minutes}m ago` : `${Math.floor(minutes / 60)}h ${minutes % 60}m ago`
+const ago = (minutes: number | null) => minutes === null ? '—' : minutes < 1 ? 'just now' : minutes < 60 ? `${minutes}m ago` : `${Math.floor(minutes / 60)}h ${minutes % 60}m ago`
 const signalCount = (t: ScoredTransaction) => t.factors.filter((factor) => !factor.baseline).length
 const breakdown = (t: ScoredTransaction) =>
   t.factors.map((factor) => `${factor.label} +${factor.points}`).join(' · ') +
@@ -278,6 +334,14 @@ function App() {
   const [reviewed, setReviewed] = useState<Record<string, boolean>>(loadReviewed)
   const [displayedCount, setDisplayedCount] = useState<number | null>(null)
   const gridRef = useRef<AgGridReact<ScoredTransaction>>(null)
+  const [testAmount, setTestAmount] = useState('1500')
+  const [checkout, setCheckout] = useState<CheckoutState>(() =>
+    returnedFromPayPal === 'return' && returnedOrderId && !isCheckoutPopup
+      ? { step: 'error', orderId: returnedOrderId, message: 'PayPal approved this payment. Connect with your demo token, then select Finish payment.' }
+      : { step: 'idle' })
+  const checkoutRef = useRef(checkout)
+  checkoutRef.current = checkout
+  const tokenRef = useRef('')
   const [sandboxCaptures, setSandboxCaptures] = useState<PayPalSandboxCapture[]>([])
   const [capturesLoading, setCapturesLoading] = useState(false)
   const [capturesError, setCapturesError] = useState('')
@@ -346,6 +410,7 @@ function App() {
             status: 'COMPLETED',
             amount: capture.amount,
             currency: capture.currency,
+            ...('createTime' in capture && typeof capture.createTime === 'string' ? { createTime: capture.createTime } : {}),
           }
         })
         setSandboxCaptures(captures)
@@ -373,6 +438,154 @@ function App() {
       // Storage can be unavailable (private mode); review state still works for this page.
     }
   }, [reviewed])
+
+  useEffect(() => { tokenRef.current = demoAccessToken }, [demoAccessToken])
+
+  // When the PayPal window reports approval, finish (capture) the payment automatically.
+  useEffect(() => {
+    if (isCheckoutPopup) return
+    function handle(message: unknown) {
+      if (!isRecord(message) || typeof message.kind !== 'string') return
+      const current = checkoutRef.current
+      if (current.step !== 'waiting' || message.orderId !== current.orderId) return
+      if (message.kind === 'cancelled') {
+        setCheckout({ step: 'error', message: 'Checkout was cancelled in PayPal. Create a new test payment to try again.' })
+        return
+      }
+      if (message.kind === 'approved') {
+        void capturePayment(current.orderId, current.amount)
+      }
+    }
+    let channel: BroadcastChannel | undefined
+    try {
+      channel = new BroadcastChannel(CHECKOUT_CHANNEL)
+      channel.onmessage = (event) => handle(event.data)
+    } catch {
+      channel = undefined
+    }
+    const onStorage = (event: StorageEvent) => {
+      if (event.key !== CHECKOUT_STORAGE_KEY || !event.newValue) return
+      try { handle(JSON.parse(event.newValue)) } catch { /* ignore malformed */ }
+    }
+    window.addEventListener('storage', onStorage)
+    return () => {
+      channel?.close()
+      window.removeEventListener('storage', onStorage)
+    }
+    // capturePayment only reads refs and setters, so the listener is registered once.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  function checkoutErrorMessage(error: string, status: number): string {
+    switch (error) {
+      case 'order_not_eligible':
+        return 'PayPal has not approved this payment yet. Finish checkout in the PayPal window, then select Finish payment.'
+      case 'order_already_captured':
+        return 'This payment was already captured.'
+      case 'unknown_order':
+        return 'The server no longer knows this order (it may have restarted). Create a new test payment.'
+      case 'capture_in_progress':
+        return 'This payment is already being captured. Wait a moment.'
+      case 'invalid_amount':
+        return 'Enter an amount between $1 and $5,000.'
+      case 'demo_access_token_required':
+      case 'invalid_demo_access_token':
+        return 'Connect with your demo access token first.'
+      case 'paypal_temporarily_unavailable':
+        return 'PayPal Sandbox is busy right now. Try again in a minute.'
+      default:
+        return `PayPal Sandbox request failed (HTTP ${status}).`
+    }
+  }
+
+  async function createTestPayment() {
+    if (!demoAccessToken) {
+      setCheckout({ step: 'error', message: 'Connect with your demo access token first.' })
+      accessTokenInput.current?.focus()
+      return
+    }
+    const amount = Number(testAmount)
+    if (!Number.isFinite(amount) || amount < 1 || amount > 5000) {
+      setCheckout({ step: 'error', message: 'Enter an amount between $1 and $5,000.' })
+      return
+    }
+    // Open the window during the click so popup blockers allow it.
+    const popup = window.open('', CHECKOUT_WINDOW_NAME, 'width=480,height=760')
+    try {
+      popup?.sessionStorage.setItem(CHECKOUT_POPUP_FLAG, '1')
+      popup?.document.write('<p style="font-family:sans-serif;padding:24px">Opening PayPal Sandbox checkout…</p>')
+    } catch {
+      // The popup still works without the flag or the placeholder text.
+    }
+    setCheckout({ step: 'creating' })
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/paypal/orders`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${demoAccessToken}` },
+        body: JSON.stringify({ amount: amount.toFixed(2) }),
+      })
+      const payload: unknown = await response.json().catch(() => null)
+      if (!response.ok || !isRecord(payload) || typeof payload.id !== 'string' || typeof payload.approvalUrl !== 'string') {
+        popup?.close()
+        const error = isRecord(payload) && typeof payload.error === 'string' ? payload.error : ''
+        setCheckout({ step: 'error', message: checkoutErrorMessage(error, response.status) })
+        return
+      }
+      const amountText = amount.toFixed(2)
+      if (popup && !popup.closed) {
+        popup.location.href = payload.approvalUrl
+      }
+      setCheckout({ step: 'waiting', orderId: payload.id, approvalUrl: payload.approvalUrl, amount: amountText })
+    } catch {
+      popup?.close()
+      setCheckout({ step: 'error', message: 'Unable to reach the backend. Check that it is running.' })
+    }
+  }
+
+  async function capturePayment(orderId: string, amount?: string) {
+    const token = tokenRef.current
+    if (!token) {
+      setCheckout({ step: 'error', orderId, amount, message: 'Connect with your demo access token, then select Finish payment.' })
+      return
+    }
+    setCheckout({ step: 'capturing', orderId, amount: amount ?? '' })
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/paypal/orders/${encodeURIComponent(orderId)}/capture`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: '{}',
+      })
+      const payload: unknown = await response.json().catch(() => null)
+      if (!response.ok) {
+        const error = isRecord(payload) && typeof payload.error === 'string' ? payload.error : ''
+        const previous = checkoutRef.current
+        const approvalUrl = previous.step === 'waiting' ? previous.approvalUrl : previous.step === 'error' ? previous.approvalUrl : undefined
+        if (error === 'order_already_captured') {
+          setCaptureRefresh((value) => value + 1)
+        }
+        setCheckout({ step: 'error', orderId: error === 'order_not_eligible' ? orderId : undefined, approvalUrl, amount, message: checkoutErrorMessage(error, response.status) })
+        return
+      }
+      const captures = isRecord(payload) && Array.isArray(payload.captures) ? payload.captures : []
+      const completed = captures.find((item: unknown) => isRecord(item) && item.status === 'COMPLETED' && typeof item.id === 'string')
+      const captureId = isRecord(completed) && typeof completed.id === 'string' ? completed.id : ''
+      const capturedAmount = isRecord(completed) && isRecord(completed.amount) && typeof completed.amount.value === 'string'
+        ? completed.amount.value
+        : amount ?? ''
+      setCheckout({ step: 'done', captureId, amount: capturedAmount })
+      setFilter('PayPal')
+      setSearch('')
+      if (captureId) {
+        aiRequestController.current?.abort()
+        setAiInvestigation(null)
+        setAiError('')
+        setSelectedId(captureId)
+      }
+      setCaptureRefresh((value) => value + 1)
+    } catch {
+      setCheckout({ step: 'error', orderId, amount, message: 'Unable to reach the backend to finish the payment. Check that it is running, then select Finish payment.' })
+    }
+  }
 
   function selectTransaction(id: string) {
     aiRequestController.current?.abort()
@@ -618,6 +831,23 @@ function App() {
     }
   }
 
+  if (isCheckoutPopup) {
+    return (
+      <div className="checkout-return">
+        <div className="brand-icon">◇</div>
+        <h1>{returnedFromPayPal === 'return' ? 'Payment approved' : 'Checkout cancelled'}</h1>
+        <p>{returnedFromPayPal === 'return'
+          ? 'RiskLens is finishing the payment and scoring it now. You can close this window.'
+          : 'No payment was taken. You can close this window.'}</p>
+        <button type="button" onClick={() => window.close()}>Close window</button>
+      </div>
+    )
+  }
+
+  const checkoutBusy = checkout.step === 'creating' || checkout.step === 'capturing'
+  const pendingOrderId = checkout.step === 'waiting' ? checkout.orderId : checkout.step === 'error' ? checkout.orderId : undefined
+  const pendingApprovalUrl = checkout.step === 'waiting' ? checkout.approvalUrl : checkout.step === 'error' ? checkout.approvalUrl : undefined
+
   return (
     <div className="app-shell">
       <aside className="sidebar">
@@ -710,6 +940,49 @@ function App() {
                 ))}
               </div>
               <p className="panel-footnote">Scores use four illustrative rules and are <strong>not</strong> validated fraud probabilities.</p>
+            </article>
+
+            <article className="panel checkout-panel" aria-label="Create a PayPal Sandbox test payment">
+              <div className="panel-heading">
+                <div><div className="eyebrow">PAYPAL SANDBOX CHECKOUT</div><h2>Run a test payment</h2></div>
+                <span className="panel-note">No real money moves</span>
+              </div>
+              <div className="checkout-controls">
+                <div className="amount-presets" role="group" aria-label="Test amount">
+                  {['10', '750', '1500'].map((value) => (
+                    <button key={value} type="button" className={testAmount === value ? 'preset active' : 'preset'} onClick={() => setTestAmount(value)} disabled={checkoutBusy}>
+                      {money(Number(value))}
+                    </button>
+                  ))}
+                </div>
+                <label className="amount-input">
+                  <span>$</span>
+                  <input type="number" min={1} max={5000} step="0.01" value={testAmount} onChange={(event) => setTestAmount(event.target.value)} aria-label="Custom test amount in USD" disabled={checkoutBusy} />
+                </label>
+                <button type="button" className="checkout-button" onClick={() => void createTestPayment()} disabled={checkoutBusy || checkout.step === 'waiting'}>
+                  {checkout.step === 'creating' ? 'Opening PayPal…' : 'Pay with PayPal Sandbox'}
+                </button>
+              </div>
+              <div className="checkout-status" role="status" aria-live="polite">
+                {checkout.step === 'idle' && <p>Creates a real PayPal Sandbox order. Approve it with your Sandbox buyer account, and RiskLens captures and scores it automatically.</p>}
+                {checkout.step === 'creating' && <p>Creating the order with PayPal…</p>}
+                {checkout.step === 'waiting' && <p>Waiting for approval in the PayPal window ({money(Number(checkout.amount))}). Log in with your Sandbox <strong>buyer</strong> account and approve.</p>}
+                {checkout.step === 'capturing' && <p>PayPal approved it. Capturing and scoring the payment…</p>}
+                {checkout.step === 'done' && <p className="ok">✓ Captured {money(Number(checkout.amount))} in PayPal Sandbox. It is now scored and selected below.</p>}
+                {checkout.step === 'error' && <p className="error">{checkout.message}</p>}
+                {pendingOrderId && (
+                  <div className="checkout-actions">
+                    <button type="button" className="capture-refresh" onClick={() => void capturePayment(pendingOrderId, checkout.step === 'waiting' ? checkout.amount : checkout.step === 'error' ? checkout.amount : undefined)} disabled={checkoutBusy}>Finish payment</button>
+                    {pendingApprovalUrl && <a className="capture-refresh" href={pendingApprovalUrl} target={CHECKOUT_WINDOW_NAME} rel="noopener">Reopen PayPal checkout</a>}
+                    <button type="button" className="link-button" onClick={() => setCheckout({ step: 'idle' })}>Start over</button>
+                  </div>
+                )}
+                {checkout.step === 'done' && (
+                  <div className="checkout-actions">
+                    <button type="button" className="link-button" onClick={() => setCheckout({ step: 'idle' })}>Run another test payment</button>
+                  </div>
+                )}
+              </div>
             </article>
 
             <article className="panel table-panel">

@@ -6,7 +6,7 @@ RiskLens AI is a payment-risk dashboard for small business owners who take payme
 
 > Built for the PayPal AI Hackathon. Uses the PayPal Sandbox (no real money moves), OpenAI, and AG Grid.
 
-- **Live demo:** `https://<your-app>.onrender.com` _(free hosting: the first load after a quiet period can take up to a minute)_
+- **Live demo:** https://risklens-ai-f2tt.onrender.com _(free hosting: the first load after a quiet period can take up to a minute)_
 - **Demo access token:** provided in the Devpost testing instructions. Paste it into the top bar and select **Connect** to unlock PayPal and AI features.
 
 ---
@@ -15,6 +15,7 @@ RiskLens AI is a payment-risk dashboard for small business owners who take payme
 
 | Feature | How it works |
 |---|---|
+| **Run a real Sandbox checkout** | Pick an amount and select **Pay with PayPal Sandbox**. PayPal's checkout opens; approve with a Sandbox buyer account and RiskLens captures the payment and scores it automatically. |
 | **Real PayPal payments, scored** | Completed PayPal Sandbox captures are loaded from the PayPal Orders API and appear in the main table with a blue **PayPal Sandbox** badge, scored by the same rules as everything else. |
 | **Transparent scoring** | Every score is the sum of visible points: a +5 baseline, then rules for large amounts, payment bursts, new customers and off-hours activity. Hover a score to see the math. Scores are capped at 100 and are not fraud probabilities. |
 | **AI investigation of real PayPal data** | For a PayPal row, the browser sends only the capture ID. The server fetches the capture directly from PayPal (amount, status, capture time, seller protection, PayPal fee, net amount) and asks the AI to explain it for a merchant, citing only those PayPal-returned facts. |
@@ -92,10 +93,12 @@ Open `http://localhost:5173`. In the top bar, paste **only the value after** `DE
 
 ### 3. Try it
 
-1. Click **PayPal Sandbox** in the sidebar and select the blue-badged row.
-2. Read **How the score adds up** in the details panel.
-3. Select **Investigate with AI**.
-4. Select **Mark transaction reviewed**.
+1. In **Run a test payment**, choose **$1,500** and select **Pay with PayPal Sandbox**.
+2. In the PayPal window, log in with a Sandbox **buyer** (personal) account from developer.paypal.com → Sandbox accounts, and approve.
+3. RiskLens captures the payment, scores it and selects it. Read **How the score adds up**.
+4. Select **Investigate with AI**, then **Mark transaction reviewed**.
+
+Captures made this way are listed until the server restarts. To keep one permanently, add its order ID to `PAYPAL_CAPTURE_ORDER_IDS`.
 
 ### Tests
 
@@ -126,8 +129,8 @@ All routes except health require `Authorization: Bearer <DEMO_ACCESS_TOKEN>`.
 | Route | Purpose |
 |---|---|
 | `GET /api/health` | Health check (public; reveals no configuration). |
-| `GET /api/paypal/captures` | PayPal-verified completed captures for the configured Sandbox orders, without payer details. |
-| `POST /api/paypal/orders` | Creates a $10.00 USD Sandbox order and returns its approval URL. |
+| `GET /api/paypal/captures` | PayPal-verified completed captures (configured orders plus ones captured this session), without payer details. |
+| `POST /api/paypal/orders` | Creates a Sandbox order (body `{ "amount": "1500.00" }`, $1 to $5,000; defaults to $10.00) and returns its approval URL. |
 | `POST /api/paypal/orders/:orderId/capture` | Captures an approved order created by this server process. |
 | `POST /api/ai/investigate` | AI investigation. Body `{ "source": "paypal_sandbox", "transactionId": "<capture id>" }` for PayPal captures (server fetches the facts from PayPal), or a demo transaction with its evidence. |
 

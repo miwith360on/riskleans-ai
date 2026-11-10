@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { once } from 'node:events'
 import { test, type TestContext } from 'node:test'
 import express from 'express'
-import paypalRouter from './paypal'
+import paypalRouter, { resetPayPalStateForTests } from './paypal'
 
 type PayPalLink = { rel: string; href: string }
 const demoAccessToken = 'test-demo-access-token-with-at-least-32-chars'
@@ -251,6 +251,7 @@ test('falls back to the approve URL when payer-action is absent', async (t) => {
   })
 
 test('returns only PayPal-verified completed captures without payer details', async (t) => {
+  resetPayPalStateForTests()
   const previousFetch = globalThis.fetch
   const previousEnvironment = {
     PAYPAL_BASE_URL: process.env.PAYPAL_BASE_URL,
@@ -343,4 +344,46 @@ test('returns only PayPal-verified completed captures without payer details', as
       currency: 'USD',
     }],
   })
+})
+
+test('rejects out-of-range test payment amounts before calling PayPal', async (t) => {
+  const calls: string[] = []
+  const previousFetch = globalThis.fetch
+  globalThis.fetch = (async (input: RequestInfo | URL) => {
+    calls.push(String(input))
+    return Response.json({})
+  }) as typeof fetch
+  t.after(() => { globalThis.fetch = previousFetch })
+  const previousToken = process.env.DEMO_ACCESS_TOKEN
+  process.env.DEMO_ACCESS_TOKEN = 'test-demo-access-token-with-at-least-32-chars'
+  t.after(() => {
+    if (previousToken === undefined) delete process.env.DEMO_ACCESS_TOKEN
+    else process.env.DEMO_ACCESS_TOKEN = previousToken
+  })
+
+  const express = (await import('express')).default
+  const { once } = await import('node:events')
+  const router = (await import('./paypal')).default
+  const app = express()
+  app.use(express.json())
+  app.use('/api/paypal', router)
+  const server = app.listen(0)
+  await once(server, 'listening')
+  t.after(() => new Promise<void>((resolve) => server.close(() => resolve())))
+  const address = server.address()
+  assert.ok(address && typeof address !== 'string')
+
+  for (const amount of [0, 5001, '-5', 'abc', '10.999']) {
+    const response = await previousFetch(`http://127.0.0.1:${address.port}/api/paypal/orders`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: 'Bearer test-demo-access-token-with-at-least-32-chars',
+      },
+      body: JSON.stringify({ amount }),
+    })
+    assert.equal(response.status, 400, `amount ${String(amount)}`)
+    assert.deepEqual(await response.json(), { error: 'invalid_amount' })
+  }
+  assert.equal(calls.length, 0)
 })
